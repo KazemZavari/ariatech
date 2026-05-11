@@ -3,8 +3,7 @@ import path from "path";
 import fs from "fs";
 import db from "../config/db";
 import { RowDataPacket, ResultSetHeader } from "mysql2";
-
-/* ==========================================
+/* ========================================== 
    Model Type
 ========================================== */
 
@@ -16,6 +15,7 @@ export interface Project extends RowDataPacket {
   description: string | null;
   project_type: string | null;
   thumbnail: string | null;
+  gallery: string[];
   video_url: string | null;
   demo_url: string | null;
   github_url: string | null;
@@ -47,6 +47,28 @@ const removeFileIfExists = (fileUrl: string | null) => {
   );
   if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
 };
+
+// const removeFileIfExists = (fileUrl?: string | null): void => {
+//   if (!fileUrl) return;
+
+//   try {
+//     const uploadsIndex = fileUrl.indexOf("/uploads/");
+//     if (uploadsIndex === -1) return;
+
+//     const relativePath = fileUrl.substring(uploadsIndex); // /uploads/projects/xxx.png
+//     // process.cwd() مسیر ریشه پروژه شماست (جایی که پوشه public قرار دارد)
+//     const fullPath = path.join(process.cwd(), "public", relativePath);
+
+//     if (fs.existsSync(fullPath)) {
+//       fs.unlinkSync(fullPath);
+//       console.log("✅ فایل فیزیکی حذف شد:", fullPath);
+//     } else {
+//       console.log("⚠️ فایل پیدا نشد:", fullPath);
+//     }
+//   } catch (err) {
+//     console.error("❌ خطا در عملیات حذف فایل:", err);
+//   }
+// };
 
 const generateSlug = (text: string): string => {
   return text
@@ -90,6 +112,11 @@ export const createProject = async (
   try {
     const body = req.body;
 
+    const files = req.files as {
+      thumbnail?: Express.Multer.File[];
+      gallery?: Express.Multer.File[];
+    };
+
     const required = ["title", "slug"];
     for (const f of required) {
       if (!body[f]) return res.status(400).json({ error: `${f} الزامی است` });
@@ -97,10 +124,18 @@ export const createProject = async (
 
     // فایل thumbnail اگر موجود بود
     let thumbnail: string | null = null;
-    const file = req.file as Express.Multer.File | undefined;
+    if (files?.thumbnail?.[0]) {
+      thumbnail = buildFileUrl(
+        req,
+        `uploads/projects/${files.thumbnail[0].filename}`,
+      );
+    }
+    let gallery: string[] = [];
 
-    if (file) {
-      thumbnail = buildFileUrl(req, `uploads/projects/${file.filename}`);
+    if (files?.gallery) {
+      gallery = files.gallery.map((file) =>
+        buildFileUrl(req, `uploads/projects/${file.filename}`),
+      );
     }
 
     // آرایه‌ها را از JSON به آرایه تبدیل می‌کنیم
@@ -116,11 +151,11 @@ export const createProject = async (
     await db.execute<ResultSetHeader>(
       `
       INSERT INTO projects 
-      (title, slug, short_description, description, project_type, thumbnail,
+      (title, slug, short_description, description, project_type, thumbnail, gallery,
        video_url, demo_url, github_url,
        technologies, features, challenges,
        role, duration, status, is_featured)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         body.title,
@@ -129,6 +164,7 @@ export const createProject = async (
         body.description ?? null,
         body.project_type ?? null,
         thumbnail,
+        JSON.stringify(gallery),
         body.video_url ?? null,
         body.demo_url ?? null,
         body.github_url ?? null,
@@ -245,6 +281,10 @@ export const updateProject = async (
       "SELECT * FROM projects WHERE id = ?",
       [id],
     );
+    const files = req.files as {
+      thumbnail?: Express.Multer.File[];
+      gallery?: Express.Multer.File[];
+    };
 
     if (rows.length === 0)
       return res.status(404).json({ error: "پروژه یافت نشد" });
@@ -254,7 +294,7 @@ export const updateProject = async (
 
     // اگر thumbnail جدید آپلود شده
     let thumbnail = current.thumbnail;
-    const file = req.file as Express.Multer.File | undefined;
+    const file = files?.thumbnail?.[0];
 
     if (file) {
       removeFileIfExists(current.thumbnail);
@@ -280,11 +320,46 @@ export const updateProject = async (
       slug = await ensureUniqueSlug(baseSlug, current.id);
     }
 
+    let gallery: string[] = [];
+    if (current.gallery) {
+      // اگر درایور دیتابیس خودش پارس کرده باشد آرایه است، وگرنه باید پارس شود
+      gallery = Array.isArray(current.gallery)
+        ? current.gallery
+        : JSON.parse(current.gallery as any);
+    }
+
+    if (body.gallery_urls) {
+      try {
+        // چون از فرانت JSON.stringify شده می‌آید، حتماً نیاز به پارس دارد
+        const keepUrls: string[] =
+          typeof body.gallery_urls === "string"
+            ? JSON.parse(body.gallery_urls)
+            : body.gallery_urls;
+
+        // پیدا کردن و حذف فایل‌های حذف شده از سرور
+        const removed = gallery.filter((g) => !keepUrls.includes(g));
+        console.log("تصاویر برای حذف:", removed); // برای دیباگ در کنسول بک‌اندر ببین
+        removed.forEach(removeFileIfExists);
+
+        gallery = keepUrls;
+      } catch (err) {
+        console.error("خطا در پردازش gallery_urls:", err);
+      }
+    }
+    const newGalleryFiles = files?.gallery || [];
+
+    if (newGalleryFiles.length > 0) {
+      const newUrls = newGalleryFiles.map((file) =>
+        buildFileUrl(req, `uploads/projects/${file.filename}`),
+      );
+
+      gallery = [...gallery, ...newUrls];
+    }
     await db.execute<ResultSetHeader>(
       `
       UPDATE projects SET
         title = ?, slug = ?, short_description = ?, description = ?, project_type = ?,
-        thumbnail = ?, video_url = ?, demo_url = ?, github_url = ?,
+        thumbnail = ?, gallery = ?, video_url = ?, demo_url = ?, github_url = ?,
         technologies = ?, features = ?, challenges = ?,
         role = ?, duration = ?, status = ?, is_featured = ?, updated_at = NOW()
       WHERE id = ?
@@ -296,6 +371,7 @@ export const updateProject = async (
         body.description ?? current.description,
         body.project_type ?? current.project_type,
         thumbnail,
+        JSON.stringify(gallery),
         body.video_url ?? current.video_url,
         body.demo_url ?? current.demo_url,
         body.github_url ?? current.github_url,
@@ -323,6 +399,38 @@ export const updateProject = async (
 /* ==========================================
    DELETE PROJECT
 ========================================== */
+// export const deleteProject = async (
+//   req: Request,
+//   res: Response,
+//   next: NextFunction,
+// ) => {
+//   try {
+//     const [rows] = await db.execute<Project[]>(
+//       "SELECT * FROM projects WHERE id = ?",
+//       [req.params.id],
+//     );
+
+//     if (rows.length === 0)
+//       return res.status(404).json({ error: "پروژه یافت نشد" });
+
+//     const current = rows[0];
+
+//     removeFileIfExists(current.thumbnail);
+//     if (current.gallery) {
+//       try {
+//         const gallery: string[] = JSON.parse(current.gallery as any);
+//         gallery.forEach(removeFileIfExists);
+//       } catch {}
+//     }
+
+//     await db.execute("DELETE FROM projects WHERE id = ?", [req.params.id]);
+
+//     res.json({ message: "پروژه با موفقیت حذف شد" });
+//   } catch (err) {
+//     next(err);
+//   }
+// };
+
 export const deleteProject = async (
   req: Request,
   res: Response,
@@ -339,11 +447,24 @@ export const deleteProject = async (
 
     const current = rows[0];
 
+    // 1. حذف تصویر شاخص
     removeFileIfExists(current.thumbnail);
 
-    await db.execute("DELETE FROM projects WHERE id = ?", [req.params.id]);
+    // 2. حذف تصاویر گالری
+    if (current.gallery) {
+      try {
+        const gallery: string[] = Array.isArray(current.gallery)
+          ? current.gallery
+          : JSON.parse(current.gallery as any);
 
-    res.json({ message: "پروژه با موفقیت حذف شد" });
+        gallery.forEach((url) => removeFileIfExists(url));
+      } catch (err) {
+        console.error("خطا در پارس گالری هنگام حذف کل پروژه:", err);
+      }
+    }
+
+    await db.execute("DELETE FROM projects WHERE id = ?", [req.params.id]);
+    res.json({ message: "پروژه و تمام تصاویر آن با موفقیت حذف شدند" });
   } catch (err) {
     next(err);
   }

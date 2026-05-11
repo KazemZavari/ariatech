@@ -8,12 +8,15 @@ const router = Router();
 /* ==========================================
    Multer Setup (Projects)
 ========================================== */
-
+ 
 const upload = createUploader("projects");
 
 // چون فقط یک فایل داریم → thumbnail
 const handleUpload = (req: Request, res: Response, next: NextFunction) => {
-  upload.single("thumbnail")(req, res, (err: any) => {
+  upload.fields([
+    { name: "thumbnail", maxCount: 1 },
+    { name: "gallery", maxCount: 10 },
+  ])(req, res, (err: any) => {
     if (err instanceof multer.MulterError) {
       if (err.code === "LIMIT_FILE_SIZE") {
         return res.status(400).json({
