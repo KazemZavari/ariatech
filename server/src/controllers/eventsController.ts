@@ -1,0 +1,684 @@
+import { Request, Response, NextFunction } from "express";
+import path from "path";
+import fs from "fs";
+import { ResultSetHeader, RowDataPacket } from "mysql2";
+import db from "../config/db";
+export interface Event extends RowDataPacket {
+  id: number;
+  title: string;
+  slug: string;
+  excerpt?: string | null;
+  status: "draft" | "published";
+  cover_image?: string | null;
+  createdAt?: Date;
+  updatedAt?: Date | null;
+}
+
+export interface EventBlock extends RowDataPacket {
+  id?: number;
+  event_id: number;
+  type: string;
+  order_index: number;
+  content: any;
+}
+const buildFileUrl = (req: Request, filePath: string) =>
+  `${req.protocol}://${req.get("host")}/${filePath.replace(/\\/g, "/")}`;
+
+const removeFileIfExists = (src?: string | null) => {
+  if (!src) return;
+
+  // اگر URL بود → تبدیل به path
+  if (src.startsWith("http")) {
+    src = src.replace(/^https?:\/\/[^/]+\/?/, "");
+  }
+
+  const filePath = path.resolve(__dirname, "..", "public", src);
+
+  if (fs.existsSync(filePath)) {
+    fs.unlinkSync(filePath);
+  }
+};
+
+const normalizeSrc = (src: string): string => {
+  // اگر URL کامل است → تبدیل به relative path
+  if (src.startsWith("http")) {
+    return src.replace(/^https?:\/\/[^/]+\/?/, "");
+  }
+
+  // اگر absolute path اشتباهی ارسال شد → فقط بخش uploads را نگه دار
+  const uploadsIndex = src.indexOf("uploads/");
+  if (uploadsIndex !== -1) {
+    return src.slice(uploadsIndex);
+  }
+
+  return src;
+};
+
+export const getEvents = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const [rows] = await db.execute<Event[]>(
+      `SELECT
+        id,
+        title,
+        slug,
+        excerpt,
+        status,
+        cover_image,
+        createdAt,
+        updatedAt
+      FROM events
+      ORDER BY createdAt DESC`,
+    );
+
+    res.status(200).json(rows);
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getEventsWhitBlocks = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    // دریافت تمام مقالات
+    const [events] = await db.execute<Event[]>(
+      `SELECT
+        id,
+        title,
+        slug,
+        excerpt,
+        status,
+        cover_image,
+        createdAt,
+        updatedAt
+      FROM events
+      ORDER BY createdAt DESC`,
+    );
+
+
+    if (!events.length) {
+      return res.status(200).json([]);
+    }
+
+    // دریافت بلاک‌ها برای هر مقاله
+    const eventsWithBlocks = await Promise.all(
+      events.map(async (event) => {
+        const [blocks] = await db.execute<EventBlock[]>(
+          `SELECT *
+           FROM event_blocks
+           WHERE event_id = ?
+           ORDER BY order_index ASC`,
+          [event.id],
+        );
+
+
+        // اطمینان از اینکه content همیشه به صورت object برگردد
+        const safeBlocks = blocks.map((block) => {
+          let content;
+          try {
+            content =
+              typeof block.content === "string"
+                ? JSON.parse(block.content)
+                : block.content;
+          } catch (err) {
+            console.warn(
+              `Warning: could not parse block content for block ID ${block.id}. Returning raw content.`,
+            );
+            content = block.content; // اگر parse نشد، همان content خام برگردد
+          }
+
+          return {
+            ...block,
+            content,
+          };
+        });
+
+        return {
+          ...event,
+          blocks: safeBlocks,
+        };
+      }),
+    );
+
+    res.status(200).json(eventsWithBlocks);
+  } catch (error) {
+    console.error("Error in getEventsWhitBlocks:", error);
+    next(error);
+  }
+};
+
+/**
+ * کنترلر مخصوص سایت اصلی برای گرفتن لیست مقالات منتشر شده
+ */
+export const getPublishedEventsForSite = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    // دریافت مقالات منتشر شده
+    const [events] = await db.execute<Event[]>(`
+      SELECT
+        id,
+        title,
+        slug,
+        excerpt,
+        status,
+        cover_image,
+        createdAt,
+        updatedAt
+      FROM events
+      WHERE status = 'published'
+      ORDER BY createdAt DESC
+    `);
+
+    if (!events.length) {
+      return res.status(200).json([]);
+    }
+
+    // دریافت بلاک‌ها برای هر مقاله
+    const eventsWithBlocks = await Promise.all(
+      events.map(async (event) => {
+        const [blocks] = await db.execute<EventBlock[]>(
+          `
+          SELECT *
+          FROM event_blocks
+          WHERE event_id = ?
+          ORDER BY order_index ASC
+        `,
+          [event.id],
+        );
+
+        return {
+          ...event,
+          blocks: blocks.map((block) => {
+            let contentParsed;
+            if (typeof block.content === "string") {
+              try {
+                contentParsed = JSON.parse(block.content);
+              } catch {
+                contentParsed = block.content; // fallback اگر JSON نبود
+              }
+            } else {
+              contentParsed = block.content; // اگر object است مستقیم برگردان
+            }
+
+            return {
+              ...block,
+              content: contentParsed,
+            };
+          }),
+        };
+      }),
+    );
+
+    res.status(200).json(eventsWithBlocks);
+  } catch (error) {
+    next(error);
+  }
+};
+export const getEventBySlug = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { slug } = req.params;
+
+    const [events] = await db.execute<Event[]>(
+      `SELECT *
+       FROM events
+       WHERE slug = ? AND status = 'published'
+       LIMIT 1`,
+      [slug],
+    );
+
+    if (!events.length)
+      return res.status(404).json({ error: "مقاله یافت نشد" });
+
+    const event = events[0];
+
+    const [blocks] = await db.execute<EventBlock[]>(
+      `SELECT *
+       FROM event_blocks
+       WHERE event_id = ?
+       ORDER BY order_index ASC`,
+      [event.id],
+    );
+
+    const parsedBlocks = blocks.map((block) => {
+      let contentParsed;
+      if (typeof block.content === "string") {
+        try {
+          contentParsed = JSON.parse(block.content);
+        } catch {
+          contentParsed = block.content;
+        }
+      } else {
+        contentParsed = block.content;
+      }
+
+      return {
+        ...block,
+        content: contentParsed,
+      };
+    });
+
+    res.status(200).json({
+      ...event,
+      blocks: parsedBlocks,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const createEvent = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  const connection = await db.getConnection();
+
+  try {
+    const { title, slug, excerpt, status } = req.body;
+
+    // parse blocks
+    let blocks: any[] = [];
+    // console.log("===== FILES RECEIVED IN CREATE =====");
+    // console.log(req.files);
+
+    if (req.body.blocks) {
+      if (typeof req.body.blocks === "string") {
+        blocks = JSON.parse(req.body.blocks);
+      } else if (Array.isArray(req.body.blocks)) {
+        blocks = req.body.blocks;
+      } else {
+        return res.status(400).json({ error: "فرمت بلاک‌ها نامعتبر است" });
+      }
+    }
+    // validations
+    if (!title) return res.status(400).json({ error: "عنوان الزامی است" });
+    if (!slug) return res.status(400).json({ error: "اسلاگ الزامی است" });
+    if (!blocks.length)
+      return res.status(400).json({ error: "حداقل یک بلاک لازم است" });
+
+    // دریافت فایل‌ها از multer
+    const files = req.files as {
+      cover_image?: Express.Multer.File[];
+      file?: Express.Multer.File[];
+      attachment_file?: Express.Multer.File[];
+    };
+
+    /* ---------- cover image ---------- */
+    let cover_image: string | null = null;
+    if (files?.cover_image?.[0]) {
+      cover_image = buildFileUrl(
+        req,
+        `uploads/events/${files.cover_image[0].filename}`,
+      );
+    }
+
+    await connection.beginTransaction();
+
+    /* ---------- insert event ---------- */
+    const [result] = await connection.execute<ResultSetHeader>(
+      `INSERT INTO events (title, slug, excerpt, status, cover_image)
+       VALUES (?, ?, ?, ?, ?)`,
+      [title, slug, excerpt ?? null, status ?? "draft", cover_image],
+    );
+
+    const eventId = result.insertId;
+
+    /* ---------- insert blocks ---------- */
+    for (const [index, block] of blocks.entries()) {
+      const content = { ...(block.content ?? {}) };
+
+      // اگر بلاک فایل دارد، مسیر سرور جایگزین blob شود
+      if (
+        ["image", "video", "file"].includes(block.type) &&
+        block.fileIndex !== undefined
+      ) {
+        const file = files?.file?.[block.fileIndex]; // مطابقت با index فایل در frontend
+        if (file) {
+          // مسیر ذخیره جداگانه برای بلاک‌ها
+          content.src = buildFileUrl(req, `uploads/events/${file.filename}`);
+
+          // اگر فایل نوع file است، نام و سایز را هم ذخیره کن
+          if (block.type === "file") {
+            content.name = file.originalname;
+            content.size = `${(file.size / 1024 / 1024).toFixed(2)} MB`;
+          }
+        }
+      }
+
+      await connection.execute(
+        `INSERT INTO event_blocks
+         (event_id, type, order_index, content)
+         VALUES (?, ?, ?, ?)`,
+        [eventId, block.type, block.order_index, JSON.stringify(content)],
+      );
+    }
+
+    await connection.commit();
+
+    res.status(201).json({ message: "مقاله با موفقیت ایجاد شد", eventId });
+  } catch (error) {
+    await connection.rollback();
+    next(error);
+  } finally {
+    connection.release();
+  }
+};
+export const getEvent = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const { id } = req.params;
+
+    const [events] = await db.execute<Event[]>(
+      "SELECT * FROM events WHERE id = ?",
+      [id],
+    );
+
+    if (!events.length)
+      return res.status(404).json({ error: "مقاله یافت نشد" });
+
+    const [blocks] = await db.execute<EventBlock[]>(
+      "SELECT * FROM event_blocks WHERE event_id = ? ORDER BY order_index",
+      [id],
+    );
+
+    const parsedBlocks = blocks.map((b) => {
+      let contentParsed;
+      if (typeof b.content === "string") {
+        try {
+          contentParsed = JSON.parse(b.content);
+        } catch {
+          contentParsed = b.content;
+        }
+      } else {
+        contentParsed = b.content;
+      }
+
+      return {
+        ...b,
+        content: contentParsed,
+      };
+    });
+
+    res.status(200).json({
+      ...events[0],
+      blocks: parsedBlocks,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/* ---------- helpers ---------- */
+const safeJsonParse = (value: any, fallback: any = {}) => {
+  try {
+    return typeof value === "string" ? JSON.parse(value) : (value ?? fallback);
+  } catch {
+    return fallback;
+  }
+};
+
+/* ---------- controller ---------- */
+export const updateEvent = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  const connection = await db.getConnection();
+
+  try {
+    const eventId = Number(req.params.id);
+    if (!eventId) {
+      return res.status(400).json({ error: "آیدی مقاله الزامی است" });
+    }
+
+    const { title, slug, excerpt, status } = req.body;
+
+    /* ---------- parse blocks safely ---------- */
+    let blocks: any[] = [];
+    // console.log("===== FILES RECEIVED =====");
+    // console.log(req.files);
+    if (req.body.blocks) {
+      if (typeof req.body.blocks === "string") {
+        blocks = JSON.parse(req.body.blocks);
+      } else if (Array.isArray(req.body.blocks)) {
+        blocks = req.body.blocks;
+      } else {
+        return res.status(400).json({ error: "فرمت blocks نامعتبر است" });
+      }
+    }
+
+    if (!title) return res.status(400).json({ error: "عنوان الزامی است" });
+    if (!slug) return res.status(400).json({ error: "اسلاگ الزامی است" });
+    if (!blocks.length) {
+      return res.status(400).json({ error: "حداقل یک بلاک لازم است" });
+    }
+
+    const files = req.files as {
+      cover_image?: Express.Multer.File[];
+      file?: Express.Multer.File[];
+    };
+
+    await connection.beginTransaction();
+
+    /* ---------- update event ---------- */
+    let newCoverImage: string | null = null;
+
+    if (files?.cover_image?.[0]) {
+      const [rows] = await connection.execute<any[]>(
+        "SELECT cover_image FROM events WHERE id = ?",
+        [eventId],
+      );
+
+      const oldCover = rows[0]?.cover_image;
+      if (oldCover) {
+        removeFileIfExists(oldCover);
+      }
+
+      newCoverImage = buildFileUrl(
+        req,
+        `uploads/events/${files.cover_image[0].filename}`,
+      );
+    }
+
+    await connection.execute(
+      `UPDATE events
+       SET title = ?, slug = ?, excerpt = ?, status = ?, cover_image = COALESCE(?, cover_image)
+       WHERE id = ?`,
+      [
+        title,
+        slug,
+        excerpt ?? null,
+        status ?? "draft",
+        newCoverImage,
+        eventId,
+      ],
+    );
+
+    /* ---------- fetch existing blocks ---------- */
+    const [existingBlocks] = await connection.execute<any[]>(
+      "SELECT id, type, content FROM event_blocks WHERE event_id = ?",
+      [eventId],
+    );
+
+    const existingBlockMap = new Map<number, any>();
+    existingBlocks.forEach((b) => existingBlockMap.set(b.id, b));
+
+    /* ---------- delete removed blocks ---------- */
+    const incomingBlockIds = blocks.filter((b) => b.id).map((b) => b.id);
+
+    for (const oldBlock of existingBlocks) {
+      if (!incomingBlockIds.includes(oldBlock.id)) {
+        const content = safeJsonParse(oldBlock.content, {});
+        if (["image", "video", "file"].includes(oldBlock.type)) {
+          removeFileIfExists(content?.src);
+        }
+
+        await connection.execute("DELETE FROM event_blocks WHERE id = ?", [
+          oldBlock.id,
+        ]);
+      }
+    }
+
+    /* ---------- insert / update blocks ---------- */
+    for (const block of blocks) {
+      let content = { ...(block.content ?? {}) };
+
+      let fileOnServer: Express.Multer.File | undefined;
+      if (
+        typeof block.fileIndex === "number" &&
+        files?.file?.[block.fileIndex]
+      ) {
+        fileOnServer = files.file[block.fileIndex];
+      }
+
+      if (fileOnServer) {
+        if (block.id && existingBlockMap.has(block.id)) {
+          const oldContent = safeJsonParse(
+            existingBlockMap.get(block.id).content,
+          );
+
+          if (oldContent?.src) {
+            removeFileIfExists(oldContent.src);
+          }
+        }
+
+        content.src = buildFileUrl(
+          req,
+          `uploads/events/${fileOnServer.filename}`,
+        );
+
+        if (block.type === "file") {
+          content.name = fileOnServer.originalname;
+          content.size = `${(fileOnServer.size / 1024 / 1024).toFixed(2)} MB`;
+        }
+      } else if (block.id && existingBlockMap.has(block.id)) {
+        const oldContent = safeJsonParse(
+          existingBlockMap.get(block.id).content,
+        );
+        content.src = oldContent.src;
+      }
+
+      // 🚫 هرگز blob را ذخیره نکن
+      if (typeof content.src === "string" && content.src.startsWith("blob:")) {
+        delete content.src;
+      }
+
+      if (block.id) {
+        await connection.execute(
+          `UPDATE event_blocks
+       SET type = ?, order_index = ?, content = ?
+       WHERE id = ?`,
+          [block.type, block.order_index, JSON.stringify(content), block.id],
+        );
+      } else {
+        await connection.execute(
+          `INSERT INTO event_blocks
+       (event_id, type, order_index, content)
+       VALUES (?, ?, ?, ?)`,
+          [eventId, block.type, block.order_index, JSON.stringify(content)],
+        );
+      }
+    }
+    await connection.commit();
+    res.status(200).json({ message: "مقاله با موفقیت آپدیت شد" });
+  } catch (error) {
+    await connection.rollback();
+    next(error);
+  } finally {
+    connection.release();
+  }
+};
+
+export const deleteEvent = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  const connection = await db.getConnection();
+
+  try {
+    const eventId = Number(req.params.id);
+    if (!eventId) {
+      return res.status(400).json({ error: "آیدی مقاله نامعتبر است" });
+    }
+
+    /* ---------- دریافت مقاله ---------- */
+    const [events] = await connection.execute<Event[]>(
+      "SELECT * FROM events WHERE id = ?",
+      [eventId],
+    );
+
+    if (!events.length) {
+      return res.status(404).json({ error: "مقاله یافت نشد" });
+    }
+
+    const event = events[0];
+
+    /* ---------- دریافت بلاک‌ها ---------- */
+    const [blocks] = await connection.execute<EventBlock[]>(
+      "SELECT type, content FROM event_blocks WHERE event_id = ?",
+      [eventId],
+    );
+
+    /* ---------- حذف کاور مقاله ---------- */
+    if (event.cover_image) {
+      removeFileIfExists(normalizeSrc(event.cover_image));
+    }
+
+    /* ---------- حذف فایل‌های بلاک‌ها ---------- */
+    for (const block of blocks) {
+      if (!block.content) continue;
+
+      let content: any;
+      try {
+        content =
+          typeof block.content === "string"
+            ? JSON.parse(block.content)
+            : block.content;
+      } catch {
+        continue; // محتوای خراب → نادیده بگیر
+      }
+
+      if (["image", "video", "file"].includes(block.type) && content?.src) {
+        removeFileIfExists(normalizeSrc(content.src));
+      }
+    }
+
+    /* ---------- حذف از دیتابیس ---------- */
+    await connection.beginTransaction();
+
+    await connection.execute(
+      "DELETE FROM event_blocks WHERE event_id = ?",
+      [eventId],
+    );
+
+    await connection.execute("DELETE FROM events WHERE id = ?", [eventId]);
+
+    await connection.commit();
+
+    res.status(200).json({
+      message: "مقاله و تمامی فایل‌های مرتبط با آن با موفقیت حذف شدند",
+    });
+  } catch (error) {
+    await connection.rollback();
+    next(error);
+  } finally {
+    connection.release();
+  }
+};

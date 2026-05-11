@@ -1,0 +1,14 @@
+# Node modules
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Build folders
+client/build/
+server/dist/
+
+# Environment files
+.env
+
+# سیستم فایل
+.DS_Store
